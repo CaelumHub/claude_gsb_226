@@ -22,7 +22,7 @@ from typing import Dict, Optional
 
 from flask import Flask, jsonify, render_template, request, send_file
 
-from backend import analysis, audio_io, chords, effects, mixer, realtime, separation, storage
+from backend import analysis, audio_io, chords, edit_session, effects, mixer, realtime, separation, storage
 
 try:
     from flask_cors import CORS
@@ -41,6 +41,8 @@ if _CORS:
 
 store = storage.Storage(DATA_DIR)
 rt = realtime.new_analyzer()
+edit_sessions = edit_session.EditSessionManager(os.path.join(DATA_DIR, "edit_sessions"))
+edit_sessions.sweep()  # remove abandoned sessions from earlier runs
 
 
 # --------------------------------------------------------------------------- #
@@ -304,76 +306,9 @@ def api_samples(file_id: str):
 # --------------------------------------------------------------------------- #
 # Waveform edits
 # --------------------------------------------------------------------------- #
-
-def _apply_edit(src_path: str, dst_path: str, op: str, params: Dict) -> None:
-    """Streaming waveform edit: trim / silence / fade / gain / normalize / reverse."""
-    with audio_io.WavReader(src_path) as r:
-        sr = r.sr
-        ch = r.channels
-        total = r.nframes
-
-        if op == "reverse":
-            bufs = [[] for _ in range(ch)]
-            for chunk in r.iter_chunks():
-                for c, ch_data in enumerate(chunk):
-                    bufs[c].extend(ch_data)
-            with audio_io.WavWriter(dst_path, sr, ch, 2) as w:
-                w.write_chunk([b[::-1] for b in bufs])
-            return
-
-        start_f = int(float(params.get("start", 0)) * sr)
-        end_f = int(float(params.get("end", total / sr)) * sr)
-        start_f = max(0, min(start_f, total))
-        end_f = max(start_f, min(end_f, total))
-
-        gain = 10.0 ** (float(params.get("gain_db", 0)) / 20.0)
-        fade_in = float(params.get("fade_in", 0)) * sr
-        fade_out = float(params.get("fade_out", 0)) * sr
-
-        # Normalise needs a peak pre-scan.
-        if op == "normalize":
-            peak = 0.0
-            with audio_io.WavReader(src_path) as rr:
-                for chunk in rr.iter_chunks():
-                    for c in chunk:
-                        for v in c:
-                            a = abs(v)
-                            if a > peak:
-                                peak = a
-            gain = (float(params.get("peak", 0.99)) / peak) if peak > 1e-9 else 1.0
-            op = "gain"
-
-        with audio_io.WavWriter(dst_path, sr, ch, 2) as w:
-            pos = 0
-            while True:
-                chunk = r.read_chunk(1 << 16)
-                if chunk is None:
-                    break
-                n = len(chunk[0])
-                out = []
-                for c in chunk:
-                    o = []
-                    for i, v in enumerate(c):
-                        gpos = pos + i
-                        x = v
-                        if op == "gain":
-                            x = x * gain
-                        if op == "trim":
-                            if gpos < start_f or gpos >= end_f:
-                                x = 0.0
-                        if op == "silence":
-                            if start_f <= gpos < end_f:
-                                x = 0.0
-                        if op == "fade":
-                            if fade_in > 0 and gpos < fade_in:
-                                x *= gpos / fade_in
-                            if fade_out > 0 and gpos >= total - fade_out:
-                                x *= (total - gpos) / fade_out
-                        o.append(x)
-                    out.append(o)
-                w.write_chunk(out)
-                pos += n
-        return
+# The multi-step editor lives in edit sessions (see below); ``_render`` lives
+# in ``backend.edit_session``.  The one-shot endpoint is kept for API
+# compatibility and registers a single derived file.
 
 
 @app.post("/api/audio/<file_id>/edit")
@@ -387,9 +322,134 @@ def api_edit(file_id: str):
 
     file_id_new = storage.new_id()
     dst = os.path.join(store.audio_dir, file_id_new + ".wav")
-    _apply_edit(_abs_path(entry), dst, op, data.get("params", {}))
+    edit_session._render(_abs_path(entry), dst, op, data.get("params", {}))
     new_entry = _register_derived(entry["id"], name, dst, {"op": op})
     return jsonify(new_entry)
+
+
+# --------------------------------------------------------------------------- #
+# Waveform edit sessions (multi-step undo / redo)
+# --------------------------------------------------------------------------- #
+#
+# A session is the waveform editor's private workspace: it holds a WAV
+# snapshot for every step (state 0 is a copy of the original file).  The
+# library file is never modified; the current state is only registered as a
+# new library file when the user explicitly saves it.
+
+@app.post("/api/edit-sessions")
+def api_edit_session_create():
+    data = request.get_json(force=True) or {}
+    entry = _entry(data.get("file_id"))
+    if not entry:
+        return jsonify(error="file not found"), 404
+    try:
+        info = edit_sessions.create(_abs_path(entry), entry["id"], entry.get("name", ""))
+    except (OSError, ValueError) as e:
+        return jsonify(error=str(e)), 400
+    return jsonify(info)
+
+
+@app.get("/api/edit-sessions/<sid>")
+def api_edit_session_get(sid: str):
+    try:
+        return jsonify(edit_sessions.get(sid))
+    except edit_session.SessionError as e:
+        return jsonify(error=str(e)), 404
+
+
+@app.get("/api/edit-sessions/<sid>/audio")
+def api_edit_session_audio(sid: str):
+    try:
+        path = edit_sessions.current_wav(sid)
+    except edit_session.SessionError as e:
+        return jsonify(error=str(e)), 404
+    return send_file(path, mimetype="audio/wav", conditional=True)
+
+
+@app.get("/api/edit-sessions/<sid>/waveform")
+def api_edit_session_waveform(sid: str):
+    try:
+        path = edit_sessions.current_wav(sid)
+    except edit_session.SessionError as e:
+        return jsonify(error=str(e)), 404
+    points = int(request.args.get("points", 3000))
+    return jsonify(analysis.waveform_envelope(path, points=points))
+
+
+@app.post("/api/edit-sessions/<sid>/apply")
+def api_edit_session_apply(sid: str):
+    data = request.get_json(force=True) or {}
+    op = data.get("op", "")
+    params = data.get("params", {}) or {}
+    try:
+        info = edit_sessions.apply(sid, op, params)
+    except edit_session.SessionError as e:
+        return jsonify(error=str(e)), 404
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
+    return jsonify(info)
+
+
+@app.post("/api/edit-sessions/<sid>/undo")
+def api_edit_session_undo(sid: str):
+    try:
+        return jsonify(edit_sessions.undo(sid))
+    except edit_session.SessionError as e:
+        return jsonify(error=str(e)), 404
+
+
+@app.post("/api/edit-sessions/<sid>/redo")
+def api_edit_session_redo(sid: str):
+    try:
+        return jsonify(edit_sessions.redo(sid))
+    except edit_session.SessionError as e:
+        return jsonify(error=str(e)), 404
+
+
+@app.post("/api/edit-sessions/<sid>/seek")
+def api_edit_session_seek(sid: str):
+    data = request.get_json(force=True) or {}
+    try:
+        index = int(data.get("index", 0))
+        return jsonify(edit_sessions.seek(sid, index))
+    except edit_session.SessionError as e:
+        return jsonify(error=str(e)), 404
+    except (TypeError, ValueError):
+        return jsonify(error="invalid step index"), 400
+
+
+@app.post("/api/edit-sessions/<sid>/commit")
+def api_edit_session_commit(sid: str):
+    """Register the current state as one new library file, then close."""
+    data = request.get_json(silent=True) or {}
+
+    def _register(source_id, source_name, wav_path, op, params, step_index):
+        if op is None:
+            # Saving the untouched original: register a plain copy.
+            name = data.get("name") or source_name
+            extra = {"edit_session_copy": True}
+        else:
+            name = data.get("name") or f"edit-{source_name}"
+            extra = {"edit_op": op, "edit_params": params, "edit_steps": step_index}
+        # _register_derived moves ``wav_path`` into the library dir, so give it
+        # the path straight from the session dir (the session itself is removed
+        # right afterwards; same filesystem, so the move is a cheap rename).
+        return _register_derived(source_id, name, wav_path, extra)
+
+    try:
+        entry = edit_sessions.commit(sid, _register)
+    except edit_session.SessionError as e:
+        return jsonify(error=str(e)), 404
+    return jsonify(entry)
+
+
+@app.delete("/api/edit-sessions/<sid>")
+def api_edit_session_discard(sid: str):
+    try:
+        edit_sessions.discard(sid)
+    except edit_session.SessionError as e:
+        return jsonify(error=str(e)), 404
+    return jsonify(ok=True)
 
 
 # --------------------------------------------------------------------------- #
