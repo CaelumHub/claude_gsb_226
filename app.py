@@ -22,7 +22,8 @@ from typing import Dict, Optional
 
 from flask import Flask, jsonify, render_template, request, send_file
 
-from backend import analysis, audio_io, chords, effects, mixer, realtime, separation, storage
+from backend import (analysis, audio_io, chords, edit_session, effects, mixer,
+                     realtime, separation, storage)
 
 try:
     from flask_cors import CORS
@@ -40,6 +41,7 @@ if _CORS:
     CORS(app)
 
 store = storage.Storage(DATA_DIR)
+edit_sessions = edit_session.EditSessionManager(DATA_DIR)
 rt = realtime.new_analyzer()
 
 
@@ -390,6 +392,168 @@ def api_edit(file_id: str):
     _apply_edit(_abs_path(entry), dst, op, data.get("params", {}))
     new_entry = _register_derived(entry["id"], name, dst, {"op": op})
     return jsonify(new_entry)
+
+
+# --------------------------------------------------------------------------- #
+# Edit sessions (undo / redo within one editing process)
+# --------------------------------------------------------------------------- #
+
+_OP_LABELS = {
+    "trim": "裁剪",
+    "silence": "静音",
+    "gain": "增益",
+    "fade": "淡入淡出",
+    "normalize": "归一化",
+    "reverse": "反转",
+}
+
+
+def _op_label(op: str, params: Dict) -> str:
+    """Human-readable description of one edit step (shown in the history list)."""
+    def f(key, default=0.0):
+        try:
+            return float(params.get(key, default))
+        except (TypeError, ValueError):
+            return default
+
+    if op == "trim":
+        return f"裁剪到选区 {f('start'):.2f}s–{f('end'):.2f}s"
+    if op == "silence":
+        return f"静音选区 {f('start'):.2f}s–{f('end'):.2f}s"
+    if op == "gain":
+        return f"增益 {f('gain_db'):+.1f} dB"
+    if op == "fade":
+        return f"淡入 {f('fade_in'):.2f}s / 淡出 {f('fade_out'):.2f}s"
+    if op == "normalize":
+        return f"归一化到 {f('peak', 0.99):.2f}"
+    if op == "reverse":
+        return "反转"
+    return _OP_LABELS.get(op, op)
+
+
+def _session_or_404(session_id: str):
+    session = edit_sessions.get(session_id)
+    if session is None:
+        return None, (jsonify(error="edit session not found (it may have expired — reload the page)"), 404)
+    return session, None
+
+
+@app.post("/api/audio/<file_id>/edit-session")
+def api_edit_session_start(file_id: str):
+    """Begin an editing process on a file; the source file is copied, never modified."""
+    entry = _entry(file_id)
+    if not entry:
+        return jsonify(error="file not found"), 404
+    return jsonify(edit_sessions.create(_abs_path(entry), entry["id"], entry["name"]))
+
+
+@app.get("/api/edit-session/<session_id>")
+def api_edit_session_state(session_id: str):
+    session, err = _session_or_404(session_id)
+    if err:
+        return err
+    with session.lock:
+        return jsonify(session._describe())
+
+
+@app.post("/api/edit-session/<session_id>/edit")
+def api_edit_session_apply(session_id: str):
+    session, err = _session_or_404(session_id)
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    op = data.get("op")
+    if op not in _OP_LABELS:
+        return jsonify(error=f"unknown op {op!r}"), 400
+    params = data.get("params", {}) or {}
+    label = data.get("label") or _op_label(op, params)
+    try:
+        desc = session.apply(op, params, label, _apply_edit)
+    except (ValueError, TypeError) as e:
+        return jsonify(error=str(e)), 400
+    return jsonify(desc)
+
+
+@app.post("/api/edit-session/<session_id>/undo")
+def api_edit_session_undo(session_id: str):
+    session, err = _session_or_404(session_id)
+    if err:
+        return err
+    desc = session.undo()
+    if desc is None:
+        return jsonify(error="nothing to undo"), 400
+    return jsonify(desc)
+
+
+@app.post("/api/edit-session/<session_id>/redo")
+def api_edit_session_redo(session_id: str):
+    session, err = _session_or_404(session_id)
+    if err:
+        return err
+    desc = session.redo()
+    if desc is None:
+        return jsonify(error="nothing to redo"), 400
+    return jsonify(desc)
+
+
+@app.post("/api/edit-session/<session_id>/goto")
+def api_edit_session_goto(session_id: str):
+    """Jump the current pointer to any step (undo or redo several at once)."""
+    session, err = _session_or_404(session_id)
+    if err:
+        return err
+    try:
+        step = int((request.get_json(force=True) or {}).get("step", 0))
+    except (TypeError, ValueError):
+        return jsonify(error="step must be an integer"), 400
+    desc = session.goto_step(step)
+    if desc is None:
+        return jsonify(error="step out of range"), 400
+    return jsonify(desc)
+
+
+@app.get("/api/edit-session/<session_id>/waveform")
+def api_edit_session_waveform(session_id: str):
+    session, err = _session_or_404(session_id)
+    if err:
+        return err
+    points = int(request.args.get("points", 2000))
+    channel = int(request.args.get("channel", 0))
+    return jsonify(analysis.waveform_envelope(session.current_path(),
+                                              points=points, channel=channel))
+
+
+@app.get("/api/edit-session/<session_id>/audio")
+def api_edit_session_audio(session_id: str):
+    session, err = _session_or_404(session_id)
+    if err:
+        return err
+    return send_file(session.current_path(), mimetype="audio/wav")
+
+
+@app.post("/api/edit-session/<session_id>/commit")
+def api_edit_session_commit(session_id: str):
+    """Materialise the current revision as a new library file and end the session."""
+    session, err = _session_or_404(session_id)
+    if err:
+        return err
+    data = request.get_json(silent=True) or {}
+    name = data.get("name") or f"edited-{session.source_name}"
+
+    fd, tmp = tempfile.mkstemp(suffix=".wav", dir=store.audio_dir)
+    os.close(fd)
+    shutil.copyfile(session.current_path(), tmp)  # overwrite the empty mkstemp file
+    entry = _register_derived(session.source_id, name, tmp, {"edited": True})
+
+    edit_sessions.drop(session_id)
+    return jsonify(entry)
+
+
+@app.delete("/api/edit-session/<session_id>")
+def api_edit_session_destroy(session_id: str):
+    if not edit_sessions.drop(session_id):
+        return jsonify(error="edit session not found"), 404
+    return jsonify(ok=True)
 
 
 # --------------------------------------------------------------------------- #

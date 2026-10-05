@@ -4,7 +4,7 @@
 <div class="main-head">
   <div>
     <h1>波形显示与编辑</h1>
-    <div class="sub">最小/最大包络波形渲染 · 区域选择 · 裁剪/静音/淡化/增益/归一化/反转</div>
+    <div class="sub">最小/最大包络波形渲染 · 区域选择 · 裁剪/静音/淡化/增益/归一化/反转 · 多步撤销/重做</div>
   </div>
   <div class="row">
     <select id="fileSel" style="min-width:220px"></select>
@@ -47,20 +47,35 @@
     <label class="field inline">淡出(s) <input type="number" id="fadeOut" value="0.5" min="0" max="10" step="0.1" style="width:70px"/></label>
     <label class="field inline">增益(dB) <input type="number" id="gainDb" value="6" min="-60" max="60" style="width:70px"/></label>
   </div>
-  <div class="mt small muted">每个操作都会生成一个新文件（保留原文件），新文件可在下方结果中选择。</div>
+  <div class="row mt">
+    <button id="undoBtn" disabled>↶ 撤销</button>
+    <button id="redoBtn" disabled>↷ 重做</button>
+    <span id="stepLabel" class="small muted">第 0 / 0 步</span>
+    <span class="spacer"></span>
+    <button class="btn-green" id="commitBtn" disabled>✓ 保存为新文件</button>
+    <button class="btn-danger" id="discardBtn" disabled>放弃本次编辑</button>
+  </div>
+  <div class="mt small muted">
+    编辑只在本次会话内进行：每一步都保存在临时会话里，可逐步撤销/重做或点击历史回到任意一步；
+    原文件始终不会被修改。确认满意后点“保存为新文件”，点“放弃”则丢弃全部修改。快捷键 Ctrl+Z / Ctrl+Y。
+  </div>
 </div>
 
-<div class="card hidden" id="resultCard">
-  <h2>编辑结果</h2>
-  <div class="row" id="resultRow"></div>
+<div class="card" id="historyCard">
+  <h2>编辑历史</h2>
+  <div id="historyList" class="history-list"></div>
 </div>
 {% endblock %}
 
 {% block scripts %}
 <script>
 let env = null, selStart = null, selEnd = null, dragging = false;
-let currentId = null;
+let currentFileId = null;
+let session = null;       // session descriptor from the server (history + pointer)
+let busy = false;
 const audio = new Audio();
+
+/* ------------------------------------------------------------------ data */
 
 async function loadFiles(selected) {
   const files = await API.get("/api/library");
@@ -69,26 +84,83 @@ async function loadFiles(selected) {
   if (selected) sel.value = selected;
 }
 
-async function loadWave() {
-  const id = $("#fileSel").value;
-  if (!id) return;
-  currentId = id;
-  env = await API.get(`/api/audio/${id}/waveform?points=3000`);
+/* Start a fresh editing session for the selected file. The previous session
+   (if any) is discarded server-side — sessions live for one editing process. */
+async function startSession(fileId, { confirmDiscard = false } = {}) {
+  if (!fileId) return;
+  if (confirmDiscard && session && session.steps > 0 &&
+      !confirm("切换文件将丢弃当前未保存的编辑，确定继续吗？")) return;
+  if (session) {
+    // best-effort cleanup; ignore errors (e.g. expired session)
+    try { await API.del(`/api/edit-session/${session.session_id}`); } catch (_) {}
+  }
+  currentFileId = fileId;
+  session = await API.post(`/api/audio/${fileId}/edit-session`, {});
   selStart = selEnd = null;
-  audio.src = API.fileUrl(id);
+  await refreshView();
+}
+
+async function refreshView() {
+  env = await API.get(`/api/edit-session/${session.session_id}/waveform?points=3000&rev=${session.rev}`);
+  audio.src = `/api/edit-session/${session.session_id}/audio?rev=${session.rev}`;
   $("#waveInfo").textContent =
     `${env.duration.toFixed(2)}s · ${env.sr} Hz · ${env.channels} 声道 · ${env.points} 采样点`;
   $("#timeLabel").textContent = `0:00.0 / ${fmtTime(env.duration)}`;
+  $("#playBtn").textContent = "▶ 播放";
+  selStart = selEnd = null;
+  $("#selLabel").textContent = "未选择区域（在波形上拖拽选择）";
   draw();
+  renderHistory();
+  renderControls();
 }
 
+/* -------------------------------------------------------------- rendering */
+
 function draw() {
-  const c = $("#wave");
-  drawWaveform(c, env, {
+  drawWaveform($("#wave"), env, {
     selection: (selStart != null && selEnd != null) ? [Math.min(selStart, selEnd), Math.max(selStart, selEnd)] : null,
     playhead: audio.duration ? audio.currentTime / audio.duration : null,
   });
 }
+
+function renderControls() {
+  const changed = session.steps > 0;
+  $("#undoBtn").disabled = !session.can_undo || busy;
+  $("#redoBtn").disabled = !session.can_redo || busy;
+  $("#commitBtn").disabled = !changed || busy;
+  $("#discardBtn").disabled = !changed || busy;
+  const visible = Math.max(0, session.history.length - 1);
+  let txt = `历史保留 ${visible} 步`;
+  if (session.history_aged) txt += "（更早的步骤已自动清理）";
+  txt += ` · 当前：${session.label}`;
+  $("#stepLabel").textContent = txt;
+}
+
+function opBadge(op) {
+  return ({
+    original: "原", trim: "裁", silence: "静", gain: "增",
+    fade: "淡", normalize: "归", reverse: "反",
+  })[op] || "·";
+}
+
+function renderHistory() {
+  const box = $("#historyList");
+  box.innerHTML = session.history.map(h => {
+    const cls = h.current ? "hist-item current" : "hist-item";
+    const mark = h.current ? "◀ " : "";
+    return `<div class="${cls}" data-step="${h.step}">
+      <span class="hist-step">${h.step}</span>
+      <span class="hist-badge op-${h.op}">${opBadge(h.op)}</span>
+      <span class="hist-label">${esc(h.label)}</span>
+      <span class="hist-current">${mark}</span>
+    </div>`;
+  }).join("");
+  box.querySelectorAll(".hist-item").forEach(el => {
+    el.onclick = () => gotoStep(+el.dataset.step);
+  });
+}
+
+/* ------------------------------------------------------------- waveform UI */
 
 const wave = $("#wave");
 wave.addEventListener("mousedown", e => {
@@ -121,6 +193,7 @@ audio.addEventListener("timeupdate", () => {
   $("#timeLabel").textContent = `${fmtTime(audio.currentTime)} / ${fmtTime(audio.duration)}`;
   draw();
 });
+audio.addEventListener("ended", () => { $("#playBtn").textContent = "▶ 播放"; });
 
 function selectionParams() {
   if (selStart == null || Math.abs(selEnd - selStart) < 0.001) return null;
@@ -129,18 +202,88 @@ function selectionParams() {
   return { start: a, end: b };
 }
 
+/* --------------------------------------------------- edit / undo / redo */
+
 async function applyEdit(op, params) {
-  const body = { op, params, name: op + "-" + $("#fileSel").selectedOptions[0].text };
-  const entry = await API.post(`/api/audio/${currentId}/edit`, body);
-  toast("编辑完成，已生成新文件", "success");
-  await loadFiles(entry.id);
-  $("#resultCard").classList.remove("hidden");
-  $("#resultRow").innerHTML = `
-    <button class="btn-green" onclick="openResult('${entry.id}')">▶ 打开新文件</button>
-    <span class="muted">${esc(entry.name)} · ${fmtTime(entry.duration)}</span>`;
+  if (!session || busy) return;
+  busy = true; renderControls();
+  try {
+    session = await API.post(`/api/edit-session/${session.session_id}/edit`, { op, params });
+    await refreshView();
+  } catch (e) {
+    toast(e.message, "error");
+  } finally {
+    busy = false; renderControls();
+  }
 }
 
-window.openResult = (id) => { $("#fileSel").value = id; loadWave(); };
+async function gotoStep(step) {
+  if (!session || busy || step === session.step) return;
+  busy = true; renderControls();
+  try {
+    session = await API.post(`/api/edit-session/${session.session_id}/goto`, { step });
+    await refreshView();
+  } catch (e) {
+    toast(e.message, "error");
+  } finally {
+    busy = false; renderControls();
+  }
+}
+
+async function undo() {
+  if (!session || busy || !session.can_undo) return;
+  busy = true; renderControls();
+  try {
+    session = await API.post(`/api/edit-session/${session.session_id}/undo`, {});
+    await refreshView();
+  } catch (e) {
+    toast(e.message, "error");
+  } finally {
+    busy = false; renderControls();
+  }
+}
+
+async function redo() {
+  if (!session || busy || !session.can_redo) return;
+  busy = true; renderControls();
+  try {
+    session = await API.post(`/api/edit-session/${session.session_id}/redo`, {});
+    await refreshView();
+  } catch (e) {
+    toast(e.message, "error");
+  } finally {
+    busy = false; renderControls();
+  }
+}
+
+async function commitEdit() {
+  if (!session || busy) return;
+  const base = $("#fileSel").selectedOptions[0].text.replace(/\.[^.]+$/, "");
+  const name = `edited-${session.steps}步-${base}.wav`;
+  busy = true; renderControls();
+  try {
+    const entry = await API.post(`/api/edit-session/${session.session_id}/commit`, { name });
+    session = null;
+    toast("已保存为新文件（原文件未改动）", "success");
+    await loadFiles(entry.id);
+    await startSession(entry.id);
+  } catch (e) {
+    toast(e.message, "error");
+  } finally {
+    busy = false; renderControls();
+  }
+}
+
+async function discardEdit() {
+  if (!session || busy || session.steps === 0) return;
+  if (!confirm("放弃本次编辑的全部修改？（原文件不受影响）")) return;
+  const fileId = currentFileId;
+  try { await API.del(`/api/edit-session/${session.session_id}`); } catch (_) {}
+  session = null;
+  await startSession(fileId);
+}
+
+/* --------------------------------------------------------------- bindings */
 
 $("#opTrim").onclick = () => { const s = selectionParams(); if (!s) return toast("请先拖拽选择区域", "warn"); applyEdit("trim", s); };
 $("#opSilence").onclick = () => { const s = selectionParams(); if (!s) return toast("请先拖拽选择区域", "warn"); applyEdit("silence", s); };
@@ -148,11 +291,29 @@ $("#opNormalize").onclick = () => applyEdit("normalize", { peak: 0.99 });
 $("#opReverse").onclick = () => applyEdit("reverse", {});
 $("#opFade").onclick = () => applyEdit("fade", { fade_in: +$("#fadeIn").value, fade_out: +$("#fadeOut").value });
 $("#opGain").onclick = () => applyEdit("gain", { gain_db: +$("#gainDb").value });
-$("#loadBtn").onclick = loadWave;
+$("#undoBtn").onclick = undo;
+$("#redoBtn").onclick = redo;
+$("#commitBtn").onclick = commitEdit;
+$("#discardBtn").onclick = discardEdit;
+$("#loadBtn").onclick = () => {
+  const id = $("#fileSel").value;
+  if (id === currentFileId) return;
+  startSession(id, { confirmDiscard: true });
+};
+
+window.addEventListener("keydown", e => {
+  const tag = (e.target.tagName || "").toLowerCase();
+  if (tag === "input" || tag === "select" || tag === "textarea") return;
+  const mod = e.ctrlKey || e.metaKey;
+  if (mod && e.key.toLowerCase() === "z" && !e.shiftKey) { e.preventDefault(); undo(); }
+  else if (mod && (e.key.toLowerCase() === "y" || (e.shiftKey && e.key.toLowerCase() === "z"))) {
+    e.preventDefault(); redo();
+  }
+});
 
 (async () => {
   await loadFiles(new URLSearchParams(location.search).get("file"));
-  await loadWave();
+  await startSession($("#fileSel").value);
 })();
 </script>
 {% endblock %}
